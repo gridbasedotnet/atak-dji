@@ -1,0 +1,482 @@
+#!/usr/bin/env bash
+#
+# setup_mediamtx_ots.sh
+#
+# One-shot MediaMTX + OpenTAKServer integration helper
+# - Downloads and configures MediaMTX
+# - Sets up systemd service
+# - Optionally configures OTS_MEDIAMTX_* in /home/<user>/ots/config.yml
+#
+# Designed for:
+#   - Raspberry Pi / Linux w/ systemd
+#   - OpenTAKServer installed in /home/<user>/ots (default)
+#
+# This script is INTERACTIVE:
+#   - asks for OTS data dir (if different)
+#   - asks for MediaMTX version (default v1.15.3)
+#   - asks whether to wire into OTS config
+#   - can auto-generate a MediaMTX API token
+
+set -euo pipefail
+
+############################
+# Helper functions
+############################
+
+info()  { echo -e "\e[32m[INFO]\e[0m  $*"; }
+warn()  { echo -e "\e[33m[WARN]\e[0m  $*"; }
+error() { echo -e "\e[31m[ERROR]\e[0m $*" >&2; }
+
+require_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    error "Required command '$1' not found. Install it and re-run."
+    exit 1
+  fi
+}
+
+############################
+# Root / environment checks
+############################
+
+if [[ "$EUID" -ne 0 ]]; then
+  error "Please run this script as root, e.g.: sudo bash $0"
+  exit 1
+fi
+
+require_cmd curl
+require_cmd tar
+require_cmd uname
+
+SUDO_USER_NAME="${SUDO_USER:-$USER}"
+OTS_HOME="$(getent passwd "$SUDO_USER_NAME" | cut -d: -f6)"
+
+if [[ -z "$OTS_HOME" ]]; then
+  error "Could not determine home directory for user '$SUDO_USER_NAME'."
+  exit 1
+fi
+
+############################
+# Ask for OTS / MediaMTX paths
+############################
+
+DEFAULT_OTS_DIR="${OTS_HOME}/ots"
+read -rp "OpenTAKServer data directory [${DEFAULT_OTS_DIR}]: " OTS_DIR
+OTS_DIR="${OTS_DIR:-$DEFAULT_OTS_DIR}"
+
+MTX_DIR="${OTS_DIR}/mediamtx"
+info "Using OTS directory: ${OTS_DIR}"
+info "MediaMTX directory will be: ${MTX_DIR}"
+
+mkdir -p "$MTX_DIR"
+
+############################
+# Choose MediaMTX version and arch
+############################
+
+DEFAULT_MTX_VERSION="v1.15.3"
+read -rp "MediaMTX version to install [${DEFAULT_MTX_VERSION}]: " MTX_VERSION
+MTX_VERSION="${MTX_VERSION:-$DEFAULT_MTX_VERSION}"
+
+ARCH_RAW="$(uname -m)"
+case "$ARCH_RAW" in
+  aarch64|arm64)
+    MTX_ARCH="arm64"
+    ;;
+  x86_64|amd64)
+    MTX_ARCH="amd64"
+    ;;
+  *)
+    warn "Unknown architecture '$ARCH_RAW'. Defaulting to 'arm64'."
+    MTX_ARCH="arm64"
+    ;;
+esac
+
+MTX_TAR="mediamtx_${MTX_VERSION#v}_linux_${MTX_ARCH}.tar.gz"
+MTX_URL="https://github.com/bluenviron/mediamtx/releases/download/${MTX_VERSION}/${MTX_TAR}"
+
+info "Will download MediaMTX from:"
+echo "  ${MTX_URL}"
+
+############################
+# Download + install MediaMTX
+############################
+
+TMP_DIR="$(mktemp -d)"
+pushd "$TMP_DIR" >/dev/null
+
+info "Downloading MediaMTX..."
+curl -fsSL -o "$MTX_TAR" "$MTX_URL"
+
+info "Extracting MediaMTX..."
+tar xzf "$MTX_TAR"
+
+if [[ ! -f mediamtx ]]; then
+  error "mediamtx binary not found after extraction."
+  exit 1
+fi
+
+info "Installing mediamtx into ${MTX_DIR}..."
+mv mediamtx "$MTX_DIR/mediamtx"
+chmod +x "$MTX_DIR/mediamtx"
+
+popd >/dev/null
+rm -rf "$TMP_DIR"
+
+############################
+# Configure TLS for WebRTC
+############################
+
+DEFAULT_CERT_DIR="${OTS_DIR}/ca/certs/opentakserver"
+DEFAULT_CERT="${DEFAULT_CERT_DIR}/opentakserver.pem"
+DEFAULT_KEY="${DEFAULT_CERT_DIR}/opentakserver.nopass.key"
+
+USE_TLS_WEbrtc="yes"
+WEBRTC_CERT="$DEFAULT_CERT"
+WEBRTC_KEY="$DEFAULT_KEY"
+
+echo
+info "WebRTC TLS configuration"
+echo "We can point MediaMTX at the same cert/key OpenTAKServer uses."
+echo "Default cert: $WEBRTC_CERT"
+echo "Default key : $WEBRTC_KEY"
+
+read -rp "Use these cert paths for WebRTC? [Y/n]: " yn
+yn="${yn:-Y}"
+if [[ "$yn" =~ ^[Nn]$ ]]; then
+  read -rp "Enter full path to WebRTC certificate (PEM) [leave blank to disable encryption]: " in_cert
+  read -rp "Enter full path to WebRTC key (PEM) [ignored if cert blank]: " in_key
+  if [[ -z "$in_cert" ]]; then
+    info "Disabling WebRTC TLS (webrtcEncryption: no)."
+    USE_TLS_WEbrtc="no"
+  else
+    WEBRTC_CERT="$in_cert"
+    WEBRTC_KEY="$in_key"
+  fi
+fi
+
+############################
+# Generate MediaMTX API token (for OTS plugin)
+############################
+
+echo
+info "MediaMTX API token for OpenTAKServer"
+echo "This token will be used in OTS config (OTS_MEDIAMTX_TOKEN) and *optionally*"
+echo "for any future webhook integrations."
+
+# Try to use Python to generate a hex token, else fallback to /dev/urandom
+GEN_TOKEN=""
+if command -v python3 >/dev/null 2>&1; then
+  GEN_TOKEN="$(python3 - << 'EOF'
+import secrets
+print(secrets.token_hex())
+EOF
+)"
+else
+  GEN_TOKEN="$(head -c 32 /dev/urandom | xxd -p)"
+fi
+
+read -rp "MediaMTX API token [auto-generated: ${GEN_TOKEN}]: " MTX_TOKEN
+MTX_TOKEN="${MTX_TOKEN:-$GEN_TOKEN}"
+
+############################
+# Create mediamtx.yml
+############################
+
+info "Writing mediamtx.yml..."
+
+MTX_CFG="${MTX_DIR}/mediamtx.yml"
+
+cat > "$MTX_CFG" <<EOF
+###############################################
+# MediaMTX Configuration for OpenTAKServer + RTMP Drone Ingest
+###############################################
+
+logLevel: info
+logDestinations: [stdout]
+readTimeout: 10s
+writeTimeout: 10s
+writeQueueSize: 512
+udpMaxPayloadSize: 1472
+
+###############################################
+# Authentication
+###############################################
+authMethod: internal
+authInternalUsers:
+  # Open access for publish/read/playback (adjust if you want auth)
+  - user: any
+    pass:
+    ips: []
+    permissions:
+      - action: publish
+      - action: read
+      - action: playback
+  # Localhost admin (API / metrics / pprof)
+  - user: any
+    pass:
+    ips: ['127.0.0.1', '::1']
+    permissions:
+      - action: api
+      - action: metrics
+      - action: pprof
+
+###############################################
+# Control API (used by OpenTAKServer plugin)
+###############################################
+api: yes
+apiAddress: :9997
+apiEncryption: no
+apiAllowOrigin: '*'
+
+###############################################
+# Metrics / Playback / Debug (disabled)
+###############################################
+metrics: no
+pprof: no
+playback: no
+
+###############################################
+# RTSP Server
+###############################################
+rtsp: yes
+rtspTransports: [udp, multicast, tcp]
+rtspEncryption: "no"
+rtspAddress: :8554
+rtspsAddress: :8322
+rtpAddress: :8000
+rtcpAddress: :8001
+rtspAuthMethods: [basic]
+
+###############################################
+# RTMP Server
+###############################################
+rtmp: yes
+rtmpAddress: :1935
+rtmpEncryption: "no"
+
+###############################################
+# HLS Server
+###############################################
+hls: yes
+hlsAddress: :8888
+hlsEncryption: no
+hlsAllowOrigin: '*'
+hlsVariant: lowLatency
+hlsSegmentCount: 7
+hlsSegmentDuration: 1s
+hlsPartDuration: 200ms
+hlsMuxerCloseAfter: 60s
+
+###############################################
+# WebRTC Server
+###############################################
+webrtc: yes
+webrtcAddress: :8889
+webrtcEncryption: ${USE_TLS_WEbrtc}
+EOF
+
+# If TLS is enabled, append key/cert; else, don’t.
+if [[ "$USE_TLS_WEbrtc" == "yes" ]]; then
+  cat >> "$MTX_CFG" <<EOF
+webrtcServerKey: ${WEBRTC_KEY}
+webrtcServerCert: ${WEBRTC_CERT}
+EOF
+fi
+
+cat >> "$MTX_CFG" <<'EOF'
+webrtcAllowOrigin: '*'
+webrtcLocalUDPAddress: :8189
+webrtcIPsFromInterfaces: yes
+webrtcICEServers2:
+  - url: stun:stun.l.google.com:19302
+webrtcHandshakeTimeout: 10s
+webrtcTrackGatherTimeout: 2s
+webrtcSTUNGatherTimeout: 5s
+
+###############################################
+# SRT Server
+###############################################
+srt: yes
+srtAddress: :8890
+
+###############################################
+# Path Defaults
+# RTMP ingest path for drone stream can be anything like:
+#   rtmp://<ip-or-host>/live/drone1
+# The "/live/..." part is a *path*; MediaMTX will dynamically create it.
+###############################################
+pathDefaults:
+  source: publisher
+  overridePublisher: yes
+  maxReaders: 0
+  useAbsoluteTimestamp: false
+  record: no
+  recordPath: ./recordings/%path/%Y-%m-%d_%H-%M-%S
+  recordFormat: fmp4
+  recordPartDuration: 1s
+  recordSegmentDuration: 1h
+  recordDeleteAfter: 1d
+  runOnInit:
+  runOnDemand:
+  runOnReady:
+  runOnRead:
+
+###############################################
+# Path Overrides
+###############################################
+paths:
+  all_others:
+EOF
+
+info "mediamtx.yml written to ${MTX_CFG}"
+
+############################
+# systemd service for MediaMTX
+############################
+
+MTX_SVC="/etc/systemd/system/mediamtx.service"
+
+info "Writing systemd unit ${MTX_SVC}..."
+
+cat > "$MTX_SVC" <<EOF
+[Unit]
+Description=MediaMTX Server
+After=network.target
+Wants=network.target
+
+[Service]
+User=${SUDO_USER_NAME}
+Group=${SUDO_USER_NAME}
+WorkingDirectory=${MTX_DIR}
+ExecStart=${MTX_DIR}/mediamtx ${MTX_DIR}/mediamtx.yml
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+info "Reloading systemd and enabling MediaMTX..."
+systemctl daemon-reload
+systemctl enable --now mediamtx
+
+info "MediaMTX status:"
+systemctl --no-pager status mediamtx || true
+
+echo
+info "Checking MediaMTX listening sockets (RTMP/HLS/WebRTC/API)..."
+if command -v ss >/dev/null 2>&1; then
+  ss -tulpen | grep -E '(:1935|:8888|:8889|:9997)' || warn "Sockets not visible in ss output."
+else
+  netstat -tulnp | grep -E '(:1935|:8888|:8889|:9997)' || warn "Sockets not visible in netstat output."
+fi
+
+############################
+# Optional: Configure OpenTAKServer integration
+############################
+
+echo
+read -rp "Configure OpenTAKServer to use MediaMTX (web video integration)? [Y/n]: " yn
+yn="${yn:-Y}"
+if [[ "$yn" =~ ^[Yy]$ ]]; then
+  OTS_CFG="${OTS_DIR}/config.yml"
+  if [[ ! -f "$OTS_CFG" ]]; then
+    warn "OTS config not found at ${OTS_CFG}. Skipping OTS integration."
+  else
+    info "Updating ${OTS_CFG} with OTS_MEDIAMTX_* keys"
+
+    # Helper to set or append a top-level key
+    set_yaml_key() {
+      local key="$1"
+      local value="$2"
+      if grep -q "^${key}:" "$OTS_CFG"; then
+        sed -i "s|^${key}:.*|${key}: ${value}|" "$OTS_CFG"
+      else
+        echo "${key}: ${value}" >> "$OTS_CFG"
+      fi
+    }
+
+    set_yaml_key "OTS_MEDIAMTX_ENABLE" "true"
+    set_yaml_key "OTS_MEDIAMTX_API_ADDRESS" "http://localhost:9997"
+    set_yaml_key "OTS_MEDIAMTX_TOKEN" "${MTX_TOKEN}"
+
+    info "Restarting OpenTAKServer to apply changes..."
+    systemctl restart opentakserver || warn "Could not restart opentakserver (check systemctl status)."
+
+    info "Quick sanity check: query MediaMTX API from OTS host"
+    curl -s http://127.0.0.1:9997/v3/paths/list || warn "MediaMTX API check failed (but MediaMTX may still be running)."
+  fi
+else
+  info "Skipping automatic OTS integration. You can manually set:"
+  echo "  OTS_MEDIAMTX_ENABLE: true"
+  echo "  OTS_MEDIAMTX_API_ADDRESS: http://localhost:9997"
+  echo "  OTS_MEDIAMTX_TOKEN: ${MTX_TOKEN}"
+fi
+
+############################
+# Final instructions
+############################
+
+echo
+info "Done. MediaMTX is installed and configured."
+
+cat <<'EOS'
+
+================= QUICK USAGE NOTES =================
+
+1) RTMP ingest for your drone (DJI, etc.)
+
+   In your drone / controller, configure:
+
+     RTMP URL:   rtmp://<PI_IP_OR_HOST>/live/<STREAM_KEY>
+
+   Example:
+
+     rtmp://192.168.1.50/live/drone1
+
+   MediaMTX will automatically create the path "live/drone1"
+   when the drone starts pushing video.
+
+2) Viewing the stream
+
+   HLS URL (if you go directly to MediaMTX):
+
+     http://<PI_IP_OR_HOST>:8888/live/drone1/index.m3u8
+
+   WebRTC URL (if you build your own web UI or use OpenTAKServer
+   integration):
+
+     http(s)://<tak-domain-or-ip>/webrtc/live/drone1
+
+   Exact web URLs depend on how Nginx / OpenTAKServer are set up. You can also go to video inside ATAK or WINTAK and download from server if using OTS. 
+
+3) Checking MediaMTX state
+
+   - Systemd service:
+
+       sudo systemctl status mediamtx
+
+   - Logs:
+
+       sudo journalctl -u mediamtx -f
+
+   - List active paths via API:
+
+       curl http://127.0.0.1:9997/v3/paths/list
+
+4) OpenTAKServer integration (if enabled)
+
+   This script set:
+
+     OTS_MEDIAMTX_ENABLE: true
+     OTS_MEDIAMTX_API_ADDRESS: http://localhost:9997
+     OTS_MEDIAMTX_TOKEN: <your token>
+
+   After restarting OpenTAKServer, your web UI should be
+   able to enumerate MediaMTX paths and show video entries
+   when RTMP streams are active as well as being able to pull from the video plugin inside TAK
+   THIS IS A TESTED AND KNOWN WORKING SCRIPT I AM ACTIVELY USING ON MY OTS BUILD
+
+=====================================================
+
+EOS
